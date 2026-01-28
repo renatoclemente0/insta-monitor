@@ -195,7 +195,6 @@ def _save_posts(items: list[dict], db_path: str = DB_PATH) -> int:
 
     return inserted
 
-
 def _send_telegram_message(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -203,18 +202,17 @@ def _send_telegram_message(text: str) -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN e/ou TELEGRAM_CHAT_ID não definidos no .env.")
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode(
-        {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        }
-    ).encode("utf-8")
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    
+    import requests
+    response = requests.post(url, json=payload, timeout=30)
+    response.raise_for_status()
+    print("📱 Mensagem enviada para o Telegram!")
 
-    req = urllib.request.Request(url, data=data, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        _ = resp.read()
 def _run_apify_scraper(usernames: list[str]) -> list[dict]:
     api_key = os.getenv("APIFY_API_KEY")
     if not api_key:
