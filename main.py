@@ -215,8 +215,6 @@ def _send_telegram_message(text: str) -> None:
     req = urllib.request.Request(url, data=data, method="POST")
     with urllib.request.urlopen(req, timeout=30) as resp:
         _ = resp.read()
-
-
 def _run_apify_scraper(usernames: list[str]) -> list[dict]:
     api_key = os.getenv("APIFY_API_KEY")
     if not api_key:
@@ -224,27 +222,24 @@ def _run_apify_scraper(usernames: list[str]) -> list[dict]:
 
     client = ApifyClient(api_key)
 
-    # Input “compatível por tentativa”: o actor pode aceitar `usernames` ou `directUrls`.
-    # Aqui usamos URLs de perfil para reduzir ambiguidade.
-    direct_urls = [f"https://www.instagram.com/{u}/" for u in usernames]
-
-    # Configura para ser rápido: 2 posts por perfil.
+    # ✅ Input ajustado para o que o robô do Apify exige
     run_input = {
-        "directUrls": direct_urls,
-        "resultsLimit": 2 * len(usernames),
-        "resultsType": "posts",
-        # opções típicas de performance; se o actor ignorar, tudo bem
-        "onlyPostsNewerThan": None,
+        "username": usernames,
+        "resultsLimit": 2,
+        "resultsType": "posts"
     }
 
+    print(f"⏳ Iniciando coleta no Apify para {len(usernames)} perfis...")
     run = client.actor("apify/instagram-post-scraper").call(run_input=run_input)
+    
     dataset_id = run.get("defaultDatasetId")
     if not dataset_id:
+        print("⚠️ Nenhum dado retornado pelo Apify.")
         return []
 
     items = list(client.dataset(dataset_id).iterate_items())
+    print(f"✅ Coleta finalizada. {len(items)} itens recebidos.")
     return items
-
 
 def main() -> int:
     _load_env_file(".env")
