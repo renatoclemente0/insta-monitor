@@ -1,5 +1,43 @@
+# Credenciais
 .env
-__pycache__
+.env.*
+
+# Banco de dados
 monitor.db
+monitor.db-journal
+monitor.db-wal
+
+# Cache do classifier
+classifier_cache.json
+
+# Lista de influencers (contem alvos de monitoramento)
 influencers.txt
-.claude
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Scripts de debug
+debug_apify.py
+inspect_db.py
+nul
+
+# Temporarios
+*.tmp
+*.mp4
+*.mp3
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
