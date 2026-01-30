@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 
 from apify_client import ApifyClient
 
+from transcriber import transcribe_video
+
 
 DB_PATH = "monitor.db"
 INFLUENCERS_PATH = "influencers.txt"
@@ -120,20 +122,14 @@ def _to_iso_utc(value) -> str | None:
 
 def _extract_post_fields(item: dict) -> dict | None:
     """
-    Extrai campos do post. Retorna None se não for vídeo (Reel).
+    Extrai campos do post. Retorna None se não for Reel (Video direto).
+    Descarta Sidecar/Carousel — aceita APENAS type == "Video".
     """
-    # Verifica se é vídeo direto ou tem vídeo em childPosts
-    is_video = item.get("type") == "Video"
-    has_video_child = False
-    
-    if not is_video and isinstance(item.get("childPosts"), list):
-        for child in item["childPosts"]:
-            if child.get("type") == "Video":
-                has_video_child = True
-                break
+    if item.get("type") != "Video":
+        return None
 
-    # ❌ Se não for vídeo, ignora esse post
-    if not (is_video or has_video_child):
+    media_url = item.get("videoUrl")
+    if not media_url:
         return None
 
     username = (
@@ -154,21 +150,6 @@ def _extract_post_fields(item: dict) -> dict | None:
 
     timestamp = _to_iso_utc(item.get("timestamp"))
 
-    # Extração da URL do vídeo
-    media_url = None
-
-    # Caso 1: post direto é vídeo
-    if item.get("type") == "Video":
-        media_url = item.get("videoUrl") or item.get("video_url") or item.get("displayUrl")
-
-    # Caso 2: carrossel (Sidecar) com vídeos dentro
-    if not media_url and isinstance(item.get("childPosts"), list):
-        for child in item["childPosts"]:
-            if child.get("type") == "Video":
-                media_url = child.get("videoUrl") or child.get("video_url") or child.get("displayUrl")
-                if media_url:
-                    break
-
     return {
         "username": username,
         "url": url,
@@ -179,30 +160,28 @@ def _extract_post_fields(item: dict) -> dict | None:
     }
 
 
-def _save_posts(items: list[dict], db_path: str = DB_PATH) -> int:
+def _save_posts(items: list[dict], db_path: str = DB_PATH) -> list[dict]:
     """
     Salva posts no SQLite, evitando duplicados por (username, url).
-    Retorna quantos foram efetivamente inseridos.
+    Retorna lista de dicts dos posts efetivamente inseridos (com 'row_id').
     """
     now = datetime.now(timezone.utc).isoformat()
-    inserted = 0
+    inserted: list[dict] = []
 
     with sqlite3.connect(db_path) as conn:
         cur = conn.cursor()
         for item in items:
             fields = _extract_post_fields(item)
-            
-            # ❌ Se retornou None (não é vídeo), pula
+
             if fields is None:
                 continue
-                
+
             if not fields["username"] or not fields["url"]:
                 continue
 
-            # Ignora posts sem URL de vídeo válida
             if not fields["media_url"]:
                 continue
-                
+
             try:
                 cur.execute(
                     """
@@ -220,12 +199,40 @@ def _save_posts(items: list[dict], db_path: str = DB_PATH) -> int:
                     ),
                 )
                 if cur.rowcount == 1:
-                    inserted += 1
+                    fields["row_id"] = cur.lastrowid
+                    inserted.append(fields)
             except sqlite3.Error:
                 continue
         conn.commit()
 
     return inserted
+
+
+def _transcribe_new_posts(posts: list[dict], db_path: str = DB_PATH) -> int:
+    """
+    Transcreve os vídeos dos posts recém-inseridos e atualiza a coluna transcript.
+    Retorna quantos foram transcritos com sucesso.
+    """
+    transcribed = 0
+    with sqlite3.connect(db_path) as conn:
+        for post in posts:
+            row_id = post["row_id"]
+            media_url = post["media_url"]
+            username = post["username"]
+            print(f"Transcrevendo Reel de @{username} ...")
+
+            text = transcribe_video(media_url)
+            if text:
+                conn.execute(
+                    "UPDATE posts SET transcript = ? WHERE id = ?",
+                    (text, row_id),
+                )
+                transcribed += 1
+                print(f"  Transcricao OK ({len(text)} chars)")
+            else:
+                print(f"  Transcricao falhou para @{username}")
+        conn.commit()
+    return transcribed
 
 
 def _send_telegram_message(text: str) -> None:
@@ -297,9 +304,13 @@ def main() -> int:
         per_user[u] = c + 1
         filtered.append(item)
 
-    saved = _save_posts(filtered, DB_PATH)
+    new_posts = _save_posts(filtered, DB_PATH)
 
-    msg = f"✅ Monitoramento concluído! {saved} Reels foram salvos."
+    if new_posts:
+        transcribed = _transcribe_new_posts(new_posts, DB_PATH)
+        print(f"{transcribed}/{len(new_posts)} Reels transcritos.")
+
+    msg = f"Monitoramento concluido! {len(new_posts)} Reels salvos."
     _send_telegram_message(msg)
 
     return 0
