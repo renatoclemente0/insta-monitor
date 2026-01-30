@@ -2,8 +2,6 @@ import os
 import sqlite3
 import sys
 import time
-import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 
 from apify_client import ApifyClient
@@ -29,7 +27,6 @@ def _load_env_file(path: str = ".env") -> None:
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            # Não sobrescreve variáveis já definidas no ambiente
             os.environ.setdefault(key, value)
 
 
@@ -43,7 +40,6 @@ def _read_influencers(path: str = INFLUENCERS_PATH) -> list[str]:
             u = raw_line.strip()
             if not u or u.startswith("#"):
                 continue
-            # Normaliza @ se existir
             if u.startswith("@"):
                 u = u[1:]
             usernames.append(u)
@@ -70,40 +66,47 @@ def _init_db(db_path: str = DB_PATH) -> None:
             )
             """
         )
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_username ON posts(username)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_timestamp ON posts(timestamp)")
+
+        def add_column_if_missing(column_name: str, column_type: str) -> None:
+            cur = conn.execute("PRAGMA table_info(posts)")
+            existing = {row[1] for row in cur.fetchall()}
+            if column_name not in existing:
+                conn.execute(f"ALTER TABLE posts ADD COLUMN {column_name} {column_type}")
+
+        add_column_if_missing("media_url", "TEXT")
+        add_column_if_missing("transcript", "TEXT")
+        add_column_if_missing("ai_label", "TEXT")
+        add_column_if_missing("ai_score", "INTEGER")
+        add_column_if_missing("ai_summary", "TEXT")
+        add_column_if_missing("ai_reason", "TEXT")
+        add_column_if_missing("ai_ran_at", "TEXT")
+
         conn.commit()
 
 
 def _to_iso_utc(value) -> str | None:
     """
     Converte diferentes formatos comuns em ISO-8601 UTC.
-    Aceita:
-    - epoch em segundos/milisegundos
-    - string ISO
-    - None
     """
     if value is None:
         return None
 
-    # epoch numérico
     if isinstance(value, (int, float)):
         v = float(value)
-        # heurística para ms
         if v > 10_000_000_000:
             v = v / 1000.0
         dt = datetime.fromtimestamp(v, tz=timezone.utc)
         return dt.isoformat()
 
-    # string
     if isinstance(value, str):
         s = value.strip()
         if not s:
             return None
-        # tenta epoch em string
         if s.isdigit():
             return _to_iso_utc(int(s))
-        # tenta ISO
         try:
             dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
             if dt.tzinfo is None:
@@ -115,38 +118,56 @@ def _to_iso_utc(value) -> str | None:
     return str(value)
 
 
-def _extract_post_fields(item: dict) -> dict:
+def _extract_post_fields(item: dict) -> dict | None:
     """
-    Tenta extrair campos do output do actor (estrutura pode variar).
+    Extrai campos do post. Retorna None se não for vídeo (Reel).
     """
+    # Verifica se é vídeo direto ou tem vídeo em childPosts
+    is_video = item.get("type") == "Video"
+    has_video_child = False
+    
+    if not is_video and isinstance(item.get("childPosts"), list):
+        for child in item["childPosts"]:
+            if child.get("type") == "Video":
+                has_video_child = True
+                break
+
+    # ❌ Se não for vídeo, ignora esse post
+    if not (is_video or has_video_child):
+        return None
+
     username = (
         item.get("ownerUsername")
         or item.get("username")
-        or (item.get("owner", {}) or {}).get("username")
-        or (item.get("author", {}) or {}).get("username")
+        or item.get("ownerFullName")
+        or item.get("inputUrl", "").split("/")[-1]
     )
-    url = item.get("url") or item.get("postUrl") or item.get("permalink")
-    caption = item.get("caption") or item.get("text") or item.get("description")
 
-    likes = (
-        item.get("likesCount")
-        or item.get("likes")
-        or item.get("likeCount")
-        or (item.get("edge_media_preview_like", {}) or {}).get("count")
-    )
+    url = item.get("url")
+    caption = item.get("caption")
+
+    likes = item.get("likesCount")
     try:
         likes = int(likes) if likes is not None else None
     except Exception:
         likes = None
 
-    ts = (
-        item.get("timestamp")
-        or item.get("takenAtTimestamp")
-        or item.get("takenAt")
-        or item.get("createdAt")
-        or item.get("date")
-    )
-    timestamp = _to_iso_utc(ts)
+    timestamp = _to_iso_utc(item.get("timestamp"))
+
+    # Extração da URL do vídeo
+    media_url = None
+
+    # Caso 1: post direto é vídeo
+    if item.get("type") == "Video":
+        media_url = item.get("videoUrl") or item.get("video_url") or item.get("displayUrl")
+
+    # Caso 2: carrossel (Sidecar) com vídeos dentro
+    if not media_url and isinstance(item.get("childPosts"), list):
+        for child in item["childPosts"]:
+            if child.get("type") == "Video":
+                media_url = child.get("videoUrl") or child.get("video_url") or child.get("displayUrl")
+                if media_url:
+                    break
 
     return {
         "username": username,
@@ -154,6 +175,7 @@ def _extract_post_fields(item: dict) -> dict:
         "caption": caption,
         "likes": likes,
         "timestamp": timestamp,
+        "media_url": media_url,
     }
 
 
@@ -169,13 +191,23 @@ def _save_posts(items: list[dict], db_path: str = DB_PATH) -> int:
         cur = conn.cursor()
         for item in items:
             fields = _extract_post_fields(item)
+            
+            # ❌ Se retornou None (não é vídeo), pula
+            if fields is None:
+                continue
+                
             if not fields["username"] or not fields["url"]:
                 continue
+
+            # Ignora posts sem URL de vídeo válida
+            if not fields["media_url"]:
+                continue
+                
             try:
                 cur.execute(
                     """
-                    INSERT OR IGNORE INTO posts (username, url, caption, likes, timestamp, scraped_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT OR IGNORE INTO posts (username, url, caption, likes, timestamp, scraped_at, media_url)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         fields["username"],
@@ -184,16 +216,17 @@ def _save_posts(items: list[dict], db_path: str = DB_PATH) -> int:
                         fields["likes"],
                         fields["timestamp"],
                         now,
+                        fields["media_url"],
                     ),
                 )
                 if cur.rowcount == 1:
                     inserted += 1
             except sqlite3.Error:
-                # não interrompe o monitoramento por um item malformado
                 continue
         conn.commit()
 
     return inserted
+
 
 def _send_telegram_message(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -213,6 +246,7 @@ def _send_telegram_message(text: str) -> None:
     response.raise_for_status()
     print("📱 Mensagem enviada para o Telegram!")
 
+
 def _run_apify_scraper(usernames: list[str]) -> list[dict]:
     api_key = os.getenv("APIFY_API_KEY")
     if not api_key:
@@ -220,14 +254,14 @@ def _run_apify_scraper(usernames: list[str]) -> list[dict]:
 
     client = ApifyClient(api_key)
 
-    # ✅ Input ajustado para o que o robô do Apify exige
+    # ✅ Input ajustado para pegar APENAS vídeos (Reels)
     run_input = {
         "username": usernames,
         "resultsLimit": 2,
-        "resultsType": "posts"
+        "resultsType": "videos"  # ← MUDANÇA AQUI
     }
 
-    print(f"⏳ Iniciando coleta no Apify para {len(usernames)} perfis...")
+    print(f"⏳ Iniciando coleta no Apify para {len(usernames)} perfis (apenas Reels)...")
     run = client.actor("apify/instagram-post-scraper").call(run_input=run_input)
     
     dataset_id = run.get("defaultDatasetId")
@@ -239,6 +273,7 @@ def _run_apify_scraper(usernames: list[str]) -> list[dict]:
     print(f"✅ Coleta finalizada. {len(items)} itens recebidos.")
     return items
 
+
 def main() -> int:
     _load_env_file(".env")
     usernames = _read_influencers(INFLUENCERS_PATH)
@@ -246,11 +281,13 @@ def main() -> int:
 
     items = _run_apify_scraper(usernames)
 
-    # Se o actor retornar mais de 2 por perfil, fazemos um corte defensivo por username.
+    # Filtro defensivo por username (máximo 2 por perfil)
     per_user: dict[str, int] = {}
     filtered: list[dict] = []
     for item in items:
         fields = _extract_post_fields(item)
+        if fields is None:  # não é vídeo
+            continue
         u = fields.get("username") or ""
         if not u:
             continue
@@ -262,7 +299,7 @@ def main() -> int:
 
     saved = _save_posts(filtered, DB_PATH)
 
-    msg = f"✅ Monitoramento concluído! {saved} posts foram analisados."
+    msg = f"✅ Monitoramento concluído! {saved} Reels foram salvos."
     _send_telegram_message(msg)
 
     return 0
@@ -272,8 +309,6 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as e:
-        # garante feedback no console e falha no exit code, sem “engolir” erro
         print(f"Erro no monitoramento: {e}", file=sys.stderr)
         time.sleep(0.1)
         raise
-
